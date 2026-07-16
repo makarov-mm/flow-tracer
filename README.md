@@ -2,7 +2,7 @@
 
 [![GitHub Sponsors](https://img.shields.io/github/sponsors/makarov-mm?style=flat&logo=github)](https://github.com/sponsors/makarov-mm)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-![C++](https://img.shields.io/badge/C%2B%2B-00599C)
+![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C)
 ![Qt](https://img.shields.io/badge/Qt-41CD52?logo=qt&logoColor=white)
 ![OpenGL](https://img.shields.io/badge/OpenGL-5586A4?logo=opengl&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-informational)
@@ -72,7 +72,8 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-Requires Qt6. C++17, Qt6 Widgets only, multithreaded on `std::thread`.
+Requires Qt6 and a C++20 compiler (GCC 10+, Clang 12+, MSVC 2019 16.10+).
+Qt6 Widgets only; multithreaded on a persistent `std::jthread` worker pool.
 3D is compute-hungry: on a weak machine start with the 96×48×48 preset and
 fewer steps/frame. This project is also the most natural candidate for a
 CUDA/Metal compute backend.

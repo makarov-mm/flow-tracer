@@ -2,7 +2,8 @@
 // Channel flow past an obstacle (sphere / cylinder / cube). The flow is made
 // visible with massless tracer particles advected through the velocity field,
 // rendered as glowing points with accumulation trails. Orbit camera.
-// C++17 / Qt6 Widgets, multithreaded CPU, no other dependencies.
+// C++20 / Qt6 Widgets, multithreaded CPU (persistent worker pool), no other
+// dependencies.
 
 #include <QApplication>
 #include <QWidget>
@@ -22,26 +23,119 @@
 #include <QGroupBox>
 #include <QStyleFactory>
 
-#include <cstdlib>
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
+#include <functional>
+#include <mutex>
+#include <numbers>
 #include <random>
+#include <stop_token>
 #include <thread>
 #include <vector>
 
-static inline float clampf(float v, float lo, float hi)
+// ------------------------------------------------------------------ thread pool
+
+// Persistent worker pool. The old code spawned and joined a fresh team of
+// std::threads for every parallel section — about a dozen times per frame.
+// Here the workers are created once (std::jthread, stopped via stop_token on
+// destruction) and jobs are handed out as [begin, end) chunks through an
+// atomic cursor, so a frame costs only condition-variable wakeups.
+class ThreadPool
 {
-    return v < lo ? lo : (v > hi ? hi : v);
-}
+public:
+    ThreadPool()
+    {
+        const unsigned n = std::max(2u, std::thread::hardware_concurrency());
+        m_workers.reserve(n);
+        for (unsigned t = 0; t < n; ++t)
+            m_workers.emplace_back([this](std::stop_token st) { workerLoop(st); });
+    }
+
+    ~ThreadPool()
+    {
+        {
+            const std::lock_guard lock(m_mutex);
+            for (auto &w : m_workers)
+                w.request_stop();
+        }
+        m_start.notify_all();
+    }
+
+    ThreadPool(const ThreadPool &) = delete;
+    ThreadPool &operator=(const ThreadPool &) = delete;
+
+    // Runs fn(begin, end) over [0, count) on the pool; blocks until done.
+    void parallelFor(int count, const std::function<void(int, int)> &fn)
+    {
+        if (count <= 0)
+            return;
+        const int T = int(m_workers.size());
+        {
+            const std::lock_guard lock(m_mutex);
+            m_fn = &fn;
+            m_count = count;
+            m_chunk = std::max(1, count / (T * 4));
+            m_next.store(0, std::memory_order_relaxed);
+            m_working = T;
+            ++m_generation;
+        }
+        m_start.notify_all();
+        std::unique_lock lock(m_mutex);
+        m_done.wait(lock, [this] { return m_working == 0; });
+        m_fn = nullptr;
+    }
+
+private:
+    void workerLoop(std::stop_token st)
+    {
+        std::uint64_t seen = 0;
+        for (;;) {
+            const std::function<void(int, int)> *fn = nullptr;
+            {
+                std::unique_lock lock(m_mutex);
+                m_start.wait(lock, [&] {
+                    return st.stop_requested() || m_generation != seen;
+                });
+                if (st.stop_requested())
+                    return;
+                seen = m_generation;
+                fn = m_fn;
+            }
+            for (;;) {
+                const int b = m_next.fetch_add(m_chunk, std::memory_order_relaxed);
+                if (b >= m_count)
+                    break;
+                (*fn)(b, std::min(m_count, b + m_chunk));
+            }
+            {
+                const std::lock_guard lock(m_mutex);
+                if (--m_working == 0)
+                    m_done.notify_all();
+            }
+        }
+    }
+
+    std::vector<std::jthread> m_workers;
+    std::mutex m_mutex;
+    std::condition_variable m_start, m_done;
+    const std::function<void(int, int)> *m_fn = nullptr;
+    std::atomic<int> m_next{0};
+    int m_count = 0, m_chunk = 1, m_working = 0;
+    std::uint64_t m_generation = 0;
+};
 
 // ---------------------------------------------------------------- D3Q19 lattice
 
-static constexpr int Q = 19;
-static constexpr int EX[Q] = { 0, 1,-1, 0, 0, 0, 0, 1,-1, 1,-1, 1,-1, 1,-1, 0, 0, 0, 0 };
-static constexpr int EY[Q] = { 0, 0, 0, 1,-1, 0, 0, 1,-1,-1, 1, 0, 0, 0, 0, 1,-1, 1,-1 };
-static constexpr int EZ[Q] = { 0, 0, 0, 0, 0, 1,-1, 0, 0, 0, 0, 1,-1,-1, 1, 1,-1,-1, 1 };
-static constexpr int OPP[Q] = { 0, 2, 1, 4, 3, 6, 5, 8, 7,10, 9,12,11,14,13,16,15,18,17 };
-static constexpr float W[Q] = {
+inline constexpr int Q = 19;
+inline constexpr std::array<int, Q> EX = { 0, 1,-1, 0, 0, 0, 0, 1,-1, 1,-1, 1,-1, 1,-1, 0, 0, 0, 0 };
+inline constexpr std::array<int, Q> EY = { 0, 0, 0, 1,-1, 0, 0, 1,-1,-1, 1, 0, 0, 0, 0, 1,-1, 1,-1 };
+inline constexpr std::array<int, Q> EZ = { 0, 0, 0, 0, 0, 1,-1, 0, 0, 0, 0, 1,-1,-1, 1, 1,-1,-1, 1 };
+inline constexpr std::array<int, Q> OPP = { 0, 2, 1, 4, 3, 6, 5, 8, 7,10, 9,12,11,14,13,16,15,18,17 };
+inline constexpr std::array<float, Q> W = {
     1.f/3.f,
     1.f/18.f, 1.f/18.f, 1.f/18.f, 1.f/18.f, 1.f/18.f, 1.f/18.f,
     1.f/36.f, 1.f/36.f, 1.f/36.f, 1.f/36.f, 1.f/36.f, 1.f/36.f,
@@ -112,8 +206,7 @@ public:
 
     void buildObstacle()
     {
-        const size_t total = size_t(m_nx) * m_ny * m_nz;
-        std::fill(m_solid.begin(), m_solid.end(), 0);
+        std::ranges::fill(m_solid, std::uint8_t{0});
         // channel walls in y and z
         for (int z = 0; z < m_nz; ++z)
             for (int y = 0; y < m_ny; ++y)
@@ -143,7 +236,6 @@ public:
                     }
                     if (in) m_solid[idx(x, y, z)] = 1;
                 }
-        (void)total;
     }
 
     void seedTracers()
@@ -187,14 +279,14 @@ protected:
         if (e->buttons() & Qt::LeftButton) {
             m_yaw   += (e->pos().x() - m_last.x()) * 0.008f;
             m_pitch += (e->pos().y() - m_last.y()) * 0.008f;
-            m_pitch = clampf(m_pitch, -1.5f, 1.5f);
+            m_pitch = std::clamp(m_pitch, -1.5f, 1.5f);
             m_last = e->pos();
         }
     }
     void wheelEvent(QWheelEvent *e) override
     {
         m_zoom *= std::pow(1.0015f, float(e->angleDelta().y()));
-        m_zoom = clampf(m_zoom, 0.3f, 4.f);
+        m_zoom = std::clamp(m_zoom, 0.3f, 4.f);
     }
 
 private slots:
@@ -209,8 +301,8 @@ private slots:
         }
         render();
         update();
-        if (const char *df = getenv("DUMP_FRAMES")) {
-            static int left = atoi(df);
+        if (qEnvironmentVariableIsSet("DUMP_FRAMES")) {
+            static int left = qEnvironmentVariableIntValue("DUMP_FRAMES");
             if (--left <= 0) { m_image.save("dump.png"); QApplication::quit(); }
         }
         if (!m_statClock.isValid() || m_statClock.hasExpired(400)) {
@@ -225,27 +317,16 @@ private:
         return (size_t(z) * m_ny + y) * m_nx + x;
     }
 
-    static int threadCount()
-    {
-        return std::max(2u, std::thread::hardware_concurrency());
-    }
-
     // parallel over (y,z) rows of length nx
-    template <class F> void parallelRows(F &&fn) const
+    template <class F> void parallelRows(F &&fn)
     {
-        const int rows = m_ny * m_nz;
-        const int T = threadCount();
-        std::vector<std::thread> th;
-        for (int t = 0; t < T; ++t) {
-            th.emplace_back([&, t] {
-                for (int r = t; r < rows; r += T)
-                    fn(r % m_ny, r / m_ny); // (y, z)
-            });
-        }
-        for (auto &x : th) x.join();
+        m_pool.parallelFor(m_ny * m_nz, [this, &fn](int b, int e) {
+            for (int r = b; r < e; ++r)
+                fn(r % m_ny, r / m_ny); // (y, z)
+        });
     }
 
-    static inline float feq(int q, float rho, float ux, float uy, float uz)
+    static constexpr float feq(int q, float rho, float ux, float uy, float uz)
     {
         float eu = EX[q] * ux + EY[q] * uy + EZ[q] * uz;
         float u2 = ux * ux + uy * uy + uz * uz;
@@ -307,7 +388,7 @@ private:
                         + 2.f * (pxy * pxy + pxz * pxz + pyz * pyz));
                     const float tau0 = 1.f / omega0;
                     const float tau = 0.5f * (tau0 + std::sqrt(tau0 * tau0
-                        + 18.f * 1.41421356f * cs2 * pi / rho));
+                        + 18.f * std::numbers::sqrt2_v<float> * cs2 * pi / rho));
                     omega = 1.f / tau;
                 }
                 for (int q = 0; q < Q; ++q)
@@ -377,29 +458,21 @@ private:
 
     void advectTracers(float dt)
     {
-        const int n = int(m_tx.size());
-        const int T = threadCount();
-        std::vector<std::thread> th;
-        for (int t = 0; t < T; ++t) {
-            th.emplace_back([&, t] {
-                std::mt19937 rng(0x51ED5 + t * 7919 + m_tick);
-                const int chunk = (n + T - 1) / T;
-                const int b = t * chunk, e = std::min(n, b + chunk);
-                for (int i = b; i < e; ++i) {
-                    float vx, vy, vz;
-                    sampleVel(m_tx[i], m_ty[i], m_tz[i], vx, vy, vz);
-                    m_tx[i] += vx * dt;
-                    m_ty[i] += vy * dt;
-                    m_tz[i] += vz * dt;
-                    const bool out = m_tx[i] < 1.f || m_tx[i] > m_nx - 2.f
-                                  || m_ty[i] < 1.f || m_ty[i] > m_ny - 2.f
-                                  || m_tz[i] < 1.f || m_tz[i] > m_nz - 2.f;
-                    if (out || m_solid[idx(int(m_tx[i]), int(m_ty[i]), int(m_tz[i]))])
-                        respawn(i, rng);
-                }
-            });
-        }
-        for (auto &x : th) x.join();
+        m_pool.parallelFor(int(m_tx.size()), [this, dt](int b, int e) {
+            std::mt19937 rng(0x51ED5u + std::uint32_t(b) * 7919u + m_tick);
+            for (int i = b; i < e; ++i) {
+                float vx, vy, vz;
+                sampleVel(m_tx[i], m_ty[i], m_tz[i], vx, vy, vz);
+                m_tx[i] += vx * dt;
+                m_ty[i] += vy * dt;
+                m_tz[i] += vz * dt;
+                const bool out = m_tx[i] < 1.f || m_tx[i] > m_nx - 2.f
+                              || m_ty[i] < 1.f || m_ty[i] > m_ny - 2.f
+                              || m_tz[i] < 1.f || m_tz[i] > m_nz - 2.f;
+                if (out || m_solid[idx(int(m_tx[i]), int(m_ty[i]), int(m_tz[i]))])
+                    respawn(i, rng);
+            }
+        });
         ++m_tick;
     }
 
@@ -452,19 +525,10 @@ private:
 
         // fade trails
         const float d = params.trailDecay;
-        {
-            const int T = threadCount();
-            std::vector<std::thread> th;
-            for (int t = 0; t < T; ++t) {
-                th.emplace_back([&, t] {
-                    const size_t total = m_accum.size();
-                    const size_t chunk = (total + T - 1) / T;
-                    const size_t b = t * chunk, e = std::min(total, b + chunk);
-                    for (size_t i = b; i < e; ++i) m_accum[i] *= d;
-                });
-            }
-            for (auto &x : th) x.join();
-        }
+        m_pool.parallelFor(int(m_accum.size()), [this, d](int b, int e) {
+            for (int i = b; i < e; ++i)
+                m_accum[i] *= d;
+        });
 
         // deposit tracers (single-threaded: benign and fast)
         const int n = int(m_tx.size());
@@ -474,7 +538,7 @@ private:
             float sx, sy, depth;
             project(m_tx[i], m_ty[i], m_tz[i], sx, sy, depth);
             const int px = int(sx), py = int(sy);
-            if (uint(px) >= uint(W2) || uint(py) >= uint(H2)) continue;
+            if (unsigned(px) >= unsigned(W2) || unsigned(py) >= unsigned(H2)) continue;
 
             float r, g, b;
             if (params.colorMode == ColorMode::Stripes) {
@@ -484,9 +548,9 @@ private:
                 sampleVel(m_tx[i], m_ty[i], m_tz[i], vx, vy, vz);
                 const float sp = std::sqrt(vx * vx + vy * vy + vz * vz) * invU;
                 if (params.colorMode == ColorMode::Speed) {
-                    r = clampf(sp * 2.f, 0.f, 1.f);
-                    g = clampf(sp * 1.2f - 0.15f, 0.f, 1.f);
-                    b = clampf(0.5f - sp * 0.3f + (sp > 0.8f ? sp - 0.8f : 0.f), 0.f, 1.f);
+                    r = std::clamp(sp * 2.f, 0.f, 1.f);
+                    g = std::clamp(sp * 1.2f - 0.15f, 0.f, 1.f);
+                    b = std::clamp(0.5f - sp * 0.3f + (sp > 0.8f ? sp - 0.8f : 0.f), 0.f, 1.f);
                 } else {
                     // vorticity magnitude via neighboring cells
                     const int x0 = int(m_tx[i]), y0 = int(m_ty[i]), z0 = int(m_tz[i]);
@@ -499,37 +563,30 @@ private:
                     const float wx = Wc(x0, yp2, z0) - Wc(x0, ym, z0) - (V(x0, y0, zp2) - V(x0, y0, zm));
                     const float wy = U(x0, y0, zp2) - U(x0, y0, zm) - (Wc(xp2, y0, z0) - Wc(xm, y0, z0));
                     const float wz = V(xp2, y0, z0) - V(xm, y0, z0) - (U(x0, yp2, z0) - U(x0, ym, z0));
-                    const float vo = clampf(std::sqrt(wx * wx + wy * wy + wz * wz)
-                                            * invU * 3.f, 0.f, 1.f);
+                    const float vo = std::clamp(std::sqrt(wx * wx + wy * wy + wz * wz)
+                                                * invU * 3.f, 0.f, 1.f);
                     hsv(0.55f - vo * 0.55f, 0.85f, 0.25f + 0.75f * vo, r, g, b);
                 }
             }
-            const float k = bright * clampf(depth, 0.55f, 1.6f);
+            const float k = bright * std::clamp(depth, 0.55f, 1.6f);
             float *acc = &m_accum[3 * (size_t(py) * W2 + px)];
             acc[0] += r * k; acc[1] += g * k; acc[2] += b * k;
         }
 
         // tone map into image
-        {
-            const int T = threadCount();
-            std::vector<std::thread> th;
-            for (int t = 0; t < T; ++t) {
-                th.emplace_back([&, t] {
-                    for (int y = t; y < H2; y += T) {
-                        QRgb *out = reinterpret_cast<QRgb *>(m_image.scanLine(y));
-                        const float *acc = &m_accum[3 * size_t(y) * W2];
-                        for (int x = 0; x < W2; ++x) {
-                            const float r = 1.f - std::exp(-acc[3 * x]);
-                            const float g = 1.f - std::exp(-acc[3 * x + 1]);
-                            const float b = 1.f - std::exp(-acc[3 * x + 2]);
-                            out[x] = qRgb(int(8 + r * 247), int(8 + g * 247),
-                                          int(12 + b * 243));
-                        }
-                    }
-                });
+        m_pool.parallelFor(H2, [this, W2](int yb, int ye) {
+            for (int y = yb; y < ye; ++y) {
+                QRgb *out = reinterpret_cast<QRgb *>(m_image.scanLine(y));
+                const float *acc = &m_accum[3 * size_t(y) * W2];
+                for (int x = 0; x < W2; ++x) {
+                    const float r = 1.f - std::exp(-acc[3 * x]);
+                    const float g = 1.f - std::exp(-acc[3 * x + 1]);
+                    const float b = 1.f - std::exp(-acc[3 * x + 2]);
+                    out[x] = qRgb(int(8 + r * 247), int(8 + g * 247),
+                                  int(12 + b * 243));
+                }
             }
-            for (auto &x : th) x.join();
-        }
+        });
 
         // overlay: domain box + obstacle silhouette
         QPainter p(&m_image);
@@ -551,7 +608,7 @@ private:
         for (int ring = 0; ring < 3; ++ring) {
             QPointF prev;
             for (int s = 0; s <= SEG; ++s) {
-                const float a = 2.f * 3.14159265f * s / SEG;
+                const float a = 2.f * std::numbers::pi_v<float> * s / SEG;
                 float px3 = m_obsX, py3 = m_obsY, pz3 = m_obsZ;
                 const float R = m_obsR;
                 if (ring == 0) { px3 += R * std::cos(a); py3 += R * std::sin(a); }
@@ -568,11 +625,13 @@ private:
     int m_nx = 128, m_ny = 64, m_nz = 64;
     std::vector<float> m_f[Q], m_fp[Q];
     std::vector<float> m_u, m_v, m_w;
-    std::vector<uint8_t> m_solid;
+    std::vector<std::uint8_t> m_solid;
     float m_obsX = 0, m_obsY = 0, m_obsZ = 0, m_obsR = 1;
 
     std::vector<float> m_tx, m_ty, m_tz, m_thue;
-    uint32_t m_tick = 1;
+    std::uint32_t m_tick = 1;
+
+    ThreadPool m_pool;
 
     QImage m_image{800, 600, QImage::Format_RGB32};
     std::vector<float> m_accum;
