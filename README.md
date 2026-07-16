@@ -1,9 +1,21 @@
 # FlowTracer
 
+[![GitHub Sponsors](https://img.shields.io/github/sponsors/makarov-mm?style=flat&logo=github)](https://github.com/sponsors/makarov-mm)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+![C++](https://img.shields.io/badge/C%2B%2B-00599C)
+![Qt](https://img.shields.io/badge/Qt-41CD52?logo=qt&logoColor=white)
+![OpenGL](https://img.shields.io/badge/OpenGL-5586A4?logo=opengl&logoColor=white)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-informational)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-0A66C2?logo=linkedin&logoColor=white)](https://www.linkedin.com/in/makarov-mm/)
+[![Threads](https://img.shields.io/badge/Threads-000000?logo=threads&logoColor=white)](https://www.threads.net/@m.m.makarov)
+[![Instagram](https://img.shields.io/badge/Instagram-E4405F?logo=instagram&logoColor=white)](https://www.instagram.com/m.m.makarov/)
+
 3D lattice Boltzmann: channel flow past a sphere, made visible with hundreds
 of thousands of glowing tracer particles and an orbit camera.
 
-![preview](preview.png)
+## Screenshot
+
+![Screenshot](preview.png)
 
 ## Physics
 
